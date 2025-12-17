@@ -2,22 +2,6 @@
 
 This plugin enables vLLM to run on Apple Silicon Macs using Metal Performance Shaders (MPS) for GPU acceleration.
 
-## Features
-
-- **Native Apple Silicon Support**: Run LLMs on Apple Silicon Macs
-- **MPS Acceleration**: Leverages PyTorch's MPS backend for GPU operations
-- **Paged Attention**: Full support for vLLM's paged attention mechanism
-- **Memory Efficient**: Optimized for unified memory architecture
-- **Drop-in Replacement**: Works with existing vLLM APIs
-
-## Requirements
-
-- macOS 12.3 or later
-- Apple Silicon Mac
-- Python 3.11 or later
-- PyTorch 2.1.0 or later with MPS support
-- vLLM 0.12.0 or later
-
 ## Installation
 
 ### Quick Install
@@ -36,19 +20,21 @@ cd vllm-metal
 uv pip install -e .
 ```
 
-## Quick Start
+## Features
 
-```python
-from vllm import LLM, SamplingParams
+- **Native Apple Silicon Support**: Run LLMs on Apple Silicon Macs
+- **MPS Acceleration**: Leverages PyTorch's MPS backend for GPU operations
+- **Paged Attention**: Full support for vLLM's paged attention mechanism
+- **Memory Efficient**: Optimized for unified memory architecture
+- **Drop-in Replacement**: Works with existing vLLM APIs
 
-# The Metal backend is automatically detected on Apple Silicon
-llm = LLM(model="meta-llama/Llama-2-7b-hf")
+## Requirements
 
-sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
-outputs = llm.generate(["Hello, my name is"], sampling_params)
-
-print(outputs[0].outputs[0].text)
-```
+- macOS 12.3 or later
+- Apple Silicon Mac
+- Python 3.11 or later
+- PyTorch 2.1.0 or later with MPS support
+- vLLM 0.12.0 or later
 
 ## Configuration
 
