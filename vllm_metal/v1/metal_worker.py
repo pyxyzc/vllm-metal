@@ -15,10 +15,12 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.utils import set_random_seed
-from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.worker.gpu_worker import Worker
 
 logger = init_logger(__name__)
+
+# GiB_bytes constant - 1 GiB in bytes
+GiB_bytes = 1024**3
 
 
 class MetalWorker(Worker):
@@ -138,6 +140,14 @@ class MetalWorker(Worker):
 
         # Construct the model runner
         self.model_runner = MPSModelRunner(self.vllm_config, self.device)
+        logger.info(
+            "MetalWorker: Created model_runner of type %s",
+            type(self.model_runner).__name__,
+        )
+        logger.info(
+            "MetalWorker: model_runner._preprocess method is %s",
+            type(self.model_runner)._preprocess,
+        )
 
     def sleep(self, level: int = 1) -> None:
         """Sleep mode is not supported on MPS."""
@@ -246,11 +256,8 @@ def _init_mps_distributed_environment(
     MPS only supports single-device operation, but we initialize the
     distributed environment for API compatibility.
     """
-    from vllm.model_executor.layers.batch_invariant import init_batch_invariance
-
     parallel_config = vllm_config.parallel_config
 
-    init_batch_invariance()
     set_custom_all_reduce(False)  # MPS doesn't support custom all-reduce
 
     init_method = distributed_init_method or "env://"
@@ -267,6 +274,4 @@ def _init_mps_distributed_environment(
     ensure_model_parallel_initialized(
         parallel_config.tensor_parallel_size,
         parallel_config.pipeline_parallel_size,
-        parallel_config.prefill_context_parallel_size,
-        parallel_config.decode_context_parallel_size,
     )

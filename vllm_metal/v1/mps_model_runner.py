@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader import get_model
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -70,18 +69,6 @@ class MPSModelRunner(GPUModelRunner):
                 if isinstance(v, CpuGpuBuffer):
                     v.gpu = v.cpu.to(self.device)
 
-    def load_model(self, eep_scale_up: bool = False) -> None:
-        """Load model onto MPS device."""
-        logger.info("Starting to load model %s on MPS...", self.model_config.model)
-        self.model = get_model(vllm_config=self.vllm_config)
-
-        # Ensure model is on MPS device
-        if hasattr(self.model, "to"):
-            self.model = self.model.to(self.device)
-
-        if self.lora_config:
-            self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
-
     def get_model(self) -> nn.Module:
         return self.model
 
@@ -131,6 +118,87 @@ class MPSModelRunner(GPUModelRunner):
         logger.debug("MPS does not support CUDA graph capture, skipping.")
         return 0
 
+    @contextmanager
+    def synchronize_input_prep(self):
+        """Synchronize input preparation for MPS.
+
+        The parent class uses CUDA events for async synchronization, but MPS
+        doesn't support the same stream semantics. We use explicit MPS
+        synchronization instead.
+        """
+        # Sync before yielding to ensure previous iteration's copies are done
+        torch.mps.synchronize()
+        try:
+            yield
+        finally:
+            # Note: we don't sync here because _preprocess() runs AFTER this
+            # context manager exits. The sync is done in _preprocess() override.
+            pass
+
+    def load_model(self, eep_scale_up: bool = False) -> None:
+        """Load model onto MPS device and wrap it for synchronization."""
+        # Call parent's load_model which handles all the complexity
+        super().load_model(eep_scale_up)
+
+        # Wrap the model's forward method to add MPS synchronization
+        self._wrap_model_forward()
+
+    def _wrap_model_forward(self) -> None:
+        """Wrap the model's forward/call method to add MPS synchronization.
+
+        MPS doesn't support CUDA stream semantics. When vLLM uses non_blocking=True
+        for CPU->GPU copies, we need explicit synchronization before the model
+        reads the input tensors.
+        """
+        original_forward = self.model.forward
+
+        def synced_forward(*args, **kwargs):
+            # Synchronize MPS before reading input tensors
+            # This ensures all async CPU->GPU copies are complete
+            torch.mps.synchronize()
+            result = original_forward(*args, **kwargs)
+            return result
+
+        # Replace the forward method
+        self.model.forward = synced_forward
+        logger.info("Wrapped model forward with MPS synchronization")
+
+    def _sample(self, logits, spec_decode_metadata):
+        """Sample with MPS synchronization.
+
+        We need to synchronize after sampling to ensure the sampler output
+        tensors are fully computed before _bookkeeping_sync reads them.
+        Without this, we get race conditions where _bookkeeping_sync reads
+        garbage values from incomplete async MPS operations.
+        """
+        logger.debug("MPSModelRunner._sample: calling parent _sample")
+        result = super()._sample(logits, spec_decode_metadata)
+        # Ensure sampling is complete before returning
+        # This prevents race conditions in _bookkeeping_sync
+        logger.debug("MPSModelRunner._sample: synchronizing MPS after sampling")
+        torch.mps.synchronize()
+        return result
+
+    def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
+        """Convert sampled token IDs tensor to Python list with MPS sync.
+
+        The parent class uses CUDA events to synchronize the async copy from
+        GPU to pinned CPU memory. Since MPS doesn't support CUDA events and
+        our placeholder events don't actually synchronize, we need to use
+        torch.mps.synchronize() instead.
+        """
+        # First, sync to ensure the sampled_token_ids tensor is fully computed
+        torch.mps.synchronize()
+
+        # Copy to pinned CPU memory
+        pinned = self.sampled_token_ids_pinned_cpu[: sampled_token_ids.shape[0]]
+        pinned.copy_(sampled_token_ids, non_blocking=True)
+
+        # Sync again to ensure the copy is complete before reading
+        torch.mps.synchronize()
+
+        return pinned.tolist()
+
 
 @contextmanager
 def _torch_cuda_wrapper():
@@ -142,8 +210,22 @@ def _torch_cuda_wrapper():
 
     class _EventPlaceholder:
         def __init__(self, *args, **kwargs) -> None:
-            self.record = lambda: None
-            self.synchronize = lambda: None
+            pass
+
+        def record(self, stream=None):
+            pass
+
+        def synchronize(self):
+            pass
+
+        def wait(self, stream=None):
+            pass
+
+        def query(self):
+            return True
+
+        def elapsed_time(self, other):
+            return 0.0
 
     class _StreamPlaceholder:
         def __init__(self, *args, **kwargs) -> None:
@@ -155,14 +237,31 @@ def _torch_cuda_wrapper():
         def __exit__(self, *args):
             pass
 
-    cuda_event = torch.Event
+        def synchronize(self):
+            pass
+
+        def wait_event(self, event):
+            pass
+
+        def wait_stream(self, stream):
+            pass
+
+        def record_event(self, event=None):
+            return _EventPlaceholder()
+
+        def query(self):
+            return True
+
+    # Save originals
+    cuda_event = torch.cuda.Event
     cuda_stream = torch.cuda.Stream
     try:
-        torch.Event = _EventPlaceholder
+        # Patch torch.cuda.Event and torch.cuda.Stream
+        torch.cuda.Event = _EventPlaceholder
         torch.cuda.Stream = _StreamPlaceholder
         yield
     finally:
-        torch.Event = cuda_event
+        torch.cuda.Event = cuda_event
         torch.cuda.Stream = cuda_stream
 
 

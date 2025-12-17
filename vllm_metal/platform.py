@@ -100,13 +100,14 @@ class MetalPlatform(Platform):
             device = torch.device(device)
 
     @classmethod
-    def get_current_memory_usage(cls, device=None) -> tuple[int, int]:
+    def get_current_memory_usage(cls, device=None) -> int:
         """Get current memory usage.
 
         Returns:
-            Tuple of (used_bytes, total_bytes)
+            used_bytes: The number of bytes currently allocated.
         """
-        return get_mps_memory_info()
+        allocated, _ = get_mps_memory_info()
+        return allocated
 
     @classmethod
     def empty_cache(cls) -> None:
@@ -130,62 +131,87 @@ class MetalPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
-        """Check and update vLLM configuration for Metal backend."""
-        from vllm.config import CompilationMode
+        """Check and update vLLM configuration for Metal backend.
 
+        Note: This method may be called multiple times during initialization,
+        and some configs may be None in early calls. We guard all accesses
+        appropriately.
+        """
+        from vllm.config.compilation import CUDAGraphMode
+
+        # Validate platform availability (always safe to check)
+        available, error = check_mps_availability()
+        if not available:
+            raise RuntimeError(f"Metal/MPS backend not available: {error}")
+
+        # Get config objects (may be None in early calls)
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
         parallel_config = vllm_config.parallel_config
         compilation_config = vllm_config.compilation_config
 
-        # Validate platform availability
-        available, error = check_mps_availability()
-        if not available:
-            raise RuntimeError(f"Metal/MPS backend not available: {error}")
+        # Set the worker class for Metal platform - this is critical!
+        # Must be done early and guarded properly.
+        if parallel_config is not None:
+            logger.info(
+                f"Metal backend: check_and_update_config called, worker_cls={parallel_config.worker_cls}"
+            )
+            if parallel_config.worker_cls == "auto":
+                parallel_config.worker_cls = "vllm_metal.v1.metal_worker.MetalWorker"
+                logger.info("Metal backend: Using MetalWorker")
+            else:
+                logger.info(
+                    f"Metal backend: worker_cls already set to {parallel_config.worker_cls}, not overriding"
+                )
+
+            # MPS doesn't support tensor parallelism
+            if parallel_config.tensor_parallel_size > 1:
+                raise ValueError(
+                    "Metal backend does not support tensor parallelism. "
+                    "Please set tensor_parallel_size=1"
+                )
+
+            # MPS doesn't support pipeline parallelism
+            if parallel_config.pipeline_parallel_size > 1:
+                raise ValueError(
+                    "Metal backend does not support pipeline parallelism. "
+                    "Please set pipeline_parallel_size=1"
+                )
 
         # Set default block size if not specified
-        if cache_config.block_size is None:
-            cache_config.block_size = 16
-            logger.info("Metal backend: Using block_size=16 for KV cache")
-
-        # MPS doesn't support tensor parallelism
-        if parallel_config.tensor_parallel_size > 1:
-            raise ValueError(
-                "Metal backend does not support tensor parallelism. "
-                "Please set tensor_parallel_size=1"
-            )
-
-        # MPS doesn't support pipeline parallelism
-        if parallel_config.pipeline_parallel_size > 1:
-            raise ValueError(
-                "Metal backend does not support pipeline parallelism. "
-                "Please set pipeline_parallel_size=1"
-            )
-
-        # Set the worker class for Metal platform
-        if parallel_config.worker_cls == "auto":
-            parallel_config.worker_cls = "vllm_metal.v1.metal_worker.MetalWorker"
+        if cache_config is not None:
+            if cache_config.block_size is None:
+                cache_config.block_size = 16
+                logger.info("Metal backend: Using block_size=16 for KV cache")
 
         # Force eager mode if configured
-        if VLLM_METAL_EAGER_MODE:
+        if model_config is not None and VLLM_METAL_EAGER_MODE:
             model_config.enforce_eager = True
             logger.info("Metal backend: Using eager mode")
 
-        # Disable torch.compile - MPS doesn't support inductor backend
-        # The inductor backend uses compile_mps_shader which is not available
-        compilation_config.mode = CompilationMode.NONE
-        compilation_config.cudagraph_capture_sizes = []
-        logger.info("Metal backend: Disabled torch.compile (not supported on MPS)")
+        # Disable CUDA graphs and torch.compile - MPS doesn't support them
+        if compilation_config is not None:
+            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+            compilation_config.cudagraph_capture_sizes = []
+            compilation_config.compile_sizes = []
+            # Disable compilation entirely - MPS doesn't support CUDA graphs
+            compilation_config.level = 0
+            logger.info(
+                "Metal backend: Disabled CUDA graphs and compilation (not supported on MPS)"
+            )
 
-        # Note: Leave cache_dtype as "auto" - the model dtype will be used
-        # MPS supports float16 and bfloat16
-        logger.info(f"Metal backend: Using KV cache dtype={cache_config.cache_dtype}")
+        # Log configuration info only when cache_config is available
+        if cache_config is not None:
+            logger.info(
+                f"Metal backend: Using KV cache dtype={cache_config.cache_dtype}"
+            )
 
-        # Log configuration
-        logger.info(
-            f"Metal backend initialized: device={cls.get_device_name()}, "
-            f"memory={cls.get_device_total_memory() / 1e9:.1f}GB"
-        )
+        # Log overall initialization only once (when parallel_config is set)
+        if parallel_config is not None:
+            logger.info(
+                f"Metal backend initialized: device={cls.get_device_name()}, "
+                f"memory={cls.get_device_total_memory() / 1e9:.1f}GB"
+            )
 
     @classmethod
     def verify_quantization(cls, quant: str) -> None:
@@ -216,10 +242,10 @@ class MetalPlatform(Platform):
         dtype,
         kv_cache_dtype,
         block_size: int,
+        use_v1: bool,
         use_mla: bool,
         has_sink: bool,
         use_sparse: bool,
-        attn_type=None,
     ) -> str:
         """Get the attention backend class path for Metal.
 
