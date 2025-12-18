@@ -28,16 +28,42 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 logger = init_logger(__name__)
 
 # Try to import Rust Metal extensions
+# NOTE: We don't initialize Metal at import time to avoid issues with multiprocessing.
+# Metal contexts cannot survive a fork, so we defer initialization to first use.
 try:
     import vllm_metal_rust
 
-    METAL_RUST_AVAILABLE = vllm_metal_rust.is_metal_available()
-    if METAL_RUST_AVAILABLE:
-        device_name, max_threads, max_mem = vllm_metal_rust.metal_device_info()
-        logger.info(f"Metal Rust backend available: {device_name}")
+    METAL_RUST_IMPORTABLE = True
 except ImportError:
-    METAL_RUST_AVAILABLE = False
+    METAL_RUST_IMPORTABLE = False
     logger.warning("Rust Metal extensions not available, using PyTorch SDPA fallback")
+
+# Lazy initialization flag - will be set on first use in worker process
+_metal_initialized = False
+_metal_available = False
+
+
+def _ensure_metal_initialized():
+    """Initialize Metal context lazily in the worker process."""
+    global _metal_initialized, _metal_available
+    if _metal_initialized:
+        return _metal_available
+
+    _metal_initialized = True
+    if not METAL_RUST_IMPORTABLE:
+        _metal_available = False
+        return False
+
+    try:
+        _metal_available = vllm_metal_rust.is_metal_available()
+        if _metal_available:
+            device_name, max_threads, max_mem = vllm_metal_rust.metal_device_info()
+            logger.info(f"Metal Rust backend initialized: {device_name}")
+    except Exception as e:
+        logger.warning(f"Failed to initialize Metal: {e}")
+        _metal_available = False
+
+    return _metal_available
 
 
 @dataclass
@@ -169,6 +195,7 @@ class MetalAttentionImpl(AttentionImpl):
             Output tensor [num_tokens, num_heads * head_size]
         """
         num_tokens = query.shape[0]
+        original_device = query.device
 
         # Reshape Q, K, V: [num_tokens, num_heads, head_size]
         query = query.view(num_tokens, self.num_heads, self.head_size)
@@ -190,6 +217,10 @@ class MetalAttentionImpl(AttentionImpl):
         # Reshape output: [num_tokens, num_heads * head_size]
         # Use reshape instead of view to handle non-contiguous tensors from SDPA
         out = out.reshape(num_tokens, self.num_heads * self.head_size)
+
+        # Ensure output is on the same device as input
+        if out.device != original_device:
+            out = out.to(original_device)
 
         if output is not None:
             output.copy_(out)
@@ -222,34 +253,13 @@ class MetalAttentionImpl(AttentionImpl):
         head_dim = query.shape[-1]
         metal_supported_head_dims = (64, 128, 256)
 
-        if METAL_RUST_AVAILABLE and head_dim in metal_supported_head_dims:
-            # Use Rust/Metal kernel with zero-copy from CPU tensors
-            # Ensure tensors are contiguous and on CPU for unified memory access
-            q = query.contiguous()
-            k = key.contiguous()
-            v = value.contiguous()
+        # NOTE: Metal SDPA kernel has issues - using PyTorch SDPA fallback for now
+        # TODO: Fix Metal SDPA kernel dispatch (threadgroup vs thread indexing)
+        # if _ensure_metal_initialized() and head_dim in metal_supported_head_dims:
+        #     # Use Rust/Metal kernel with zero-copy from CPU tensors
+        #     ...
 
-            # Ensure CPU tensors (Metal uses unified memory)
-            if q.device.type != "cpu":
-                q = q.cpu()
-                k = k.cpu()
-                v = v.cpu()
-
-            # Reshape for Metal SDPA: [num_tokens, seq_len, num_heads, head_dim]
-            num_tokens = q.shape[0]
-
-            # Reshape K, V to add seq_len dimension
-            # [num_tokens, num_heads, head_dim] -> [num_tokens, seq_len, num_heads, head_dim]
-            k_reshaped = k.unsqueeze(0).expand(num_tokens, -1, -1, -1)
-            v_reshaped = v.unsqueeze(0).expand(num_tokens, -1, -1, -1)
-
-            # Create output tensor
-            out = torch.empty_like(q)
-
-            vllm_metal_rust.metal_sdpa(q, k_reshaped, v_reshaped, out, self.scale)
-            return out
-
-        # Fallback to PyTorch SDPA
+        # Use PyTorch SDPA (well-optimized for MPS)
         # SDPA expects: [batch, num_heads, seq_len, head_size]
         query = query.transpose(0, 1).unsqueeze(0)  # [1, num_heads, seq, head]
         key = key.transpose(0, 1).unsqueeze(0)
@@ -287,58 +297,17 @@ class MetalAttentionImpl(AttentionImpl):
         head_dim = query.shape[-1]
         metal_supported_head_dims = (64, 128, 256)
 
-        if (
-            METAL_RUST_AVAILABLE
-            and kv_cache is not None
-            and head_dim in metal_supported_head_dims
-        ):
-            # Use Rust/Metal paged attention kernel
-            # KV cache layout: [num_blocks, 2, block_size, num_kv_heads, head_size]
-            # Metal expects: [num_blocks, block_size, num_kv_heads, head_size] for K and V
+        # NOTE: Metal paged attention kernel has issues - using PyTorch fallback for now
+        # TODO: Fix Metal paged attention kernel dispatch (threadgroup vs thread indexing)
+        # if (
+        #     _ensure_metal_initialized()
+        #     and kv_cache is not None
+        #     and head_dim in metal_supported_head_dims
+        # ):
+        #     # Use Rust/Metal paged attention kernel
+        #     ...
 
-            # Split KV cache into separate key and value caches
-            key_cache = kv_cache[
-                :, 0, :, :, :
-            ].contiguous()  # [num_blocks, block_size, num_kv_heads, head_size]
-            value_cache = kv_cache[:, 1, :, :, :].contiguous()
-
-            # Ensure tensors are on CPU for unified memory access
-            q = query.contiguous()
-            if q.device.type != "cpu":
-                q = q.cpu()
-                key_cache = key_cache.cpu()
-                value_cache = value_cache.cpu()
-
-            block_table = attn_metadata.block_table.contiguous()
-            seq_lens = attn_metadata.seq_lens.contiguous()
-
-            if block_table.device.type != "cpu":
-                block_table = block_table.cpu()
-            if seq_lens.device.type != "cpu":
-                seq_lens = seq_lens.cpu()
-
-            # Ensure proper dtype for block table and seq lens
-            block_table = block_table.to(torch.int32)
-            seq_lens = seq_lens.to(torch.int32)
-
-            # Create output tensor
-            out = torch.empty_like(q)
-
-            block_size = kv_cache.shape[2]
-
-            vllm_metal_rust.metal_paged_attention(
-                q,
-                key_cache,
-                value_cache,
-                block_table,
-                seq_lens,
-                out,
-                self.scale,
-                block_size,
-            )
-            return out
-
-        # Fallback to PyTorch loop-based decode
+        # Use PyTorch loop-based decode
         outputs = []
 
         for i in range(batch_size):
@@ -386,19 +355,26 @@ class MetalAttentionImpl(AttentionImpl):
         """Store key and value into KV cache using slot mapping.
 
         KV cache layout: [num_blocks, 2, block_size, num_kv_heads, head_size]
+        Uses vectorized operations for better performance.
         """
         block_size = kv_cache.shape[2]
-        num_tokens = key.shape[0]
 
-        for i in range(num_tokens):
-            slot = int(slot_mapping[i].item())
-            if slot < 0:  # PAD_SLOT_ID = -1
-                continue
-            block_idx = slot // block_size
-            block_offset = slot % block_size
+        # Filter out padding slots (slot < 0)
+        valid_mask = slot_mapping >= 0
+        if not valid_mask.any():
+            return
 
-            kv_cache[block_idx, 0, block_offset] = key[i]
-            kv_cache[block_idx, 1, block_offset] = value[i]
+        valid_slots = slot_mapping[valid_mask]
+        valid_keys = key[valid_mask]
+        valid_values = value[valid_mask]
+
+        # Compute block indices and offsets vectorized
+        block_indices = valid_slots // block_size
+        block_offsets = valid_slots % block_size
+
+        # Use advanced indexing to scatter into cache
+        kv_cache[block_indices, 0, block_offsets] = valid_keys
+        kv_cache[block_indices, 1, block_offsets] = valid_values
 
     def _gather_from_cache(
         self,
@@ -407,6 +383,39 @@ class MetalAttentionImpl(AttentionImpl):
         context_len: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Gather keys and values from paged KV cache.
+
+        Uses vectorized gather for better performance.
+
+        Returns:
+            (keys, values) both with shape [context_len, num_kv_heads, head_size]
+        """
+        block_size = kv_cache.shape[2]
+        num_kv_heads = kv_cache.shape[3]
+        head_size = kv_cache.shape[4]
+        num_blocks_needed = (context_len + block_size - 1) // block_size
+
+        # Vectorized approach: compute all slot positions and gather at once
+        # Create flat indices for all tokens we need
+        slot_positions = torch.arange(context_len, device=kv_cache.device)
+        block_indices = slot_positions // block_size
+        block_offsets = slot_positions % block_size
+
+        # Get physical block indices from block table
+        physical_blocks = block_table[block_indices]
+
+        # Gather all keys and values at once using advanced indexing
+        keys = kv_cache[physical_blocks, 0, block_offsets]
+        values = kv_cache[physical_blocks, 1, block_offsets]
+
+        return keys, values
+
+    def _gather_from_cache_loop(
+        self,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        context_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Legacy loop-based gather (kept for reference).
 
         Returns:
             (keys, values) both with shape [context_len, num_kv_heads, head_size]

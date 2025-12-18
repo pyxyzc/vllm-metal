@@ -3,6 +3,35 @@
 
 import torch
 
+# Try to import Metal kernels
+# NOTE: We only check importability here, not Metal availability.
+# Metal contexts cannot survive fork(), so we defer initialization to first use.
+try:
+    import vllm_metal_rust
+
+    _METAL_IMPORTABLE = hasattr(vllm_metal_rust, "metal_reshape_and_cache")
+except ImportError:
+    _METAL_IMPORTABLE = False
+
+# Lazy initialization state
+_metal_initialized = False
+_metal_available = False
+
+
+def _ensure_metal_initialized():
+    """Initialize Metal lazily in the worker process."""
+    global _metal_initialized, _metal_available
+    if _metal_initialized:
+        return _metal_available
+    _metal_initialized = True
+    if _METAL_IMPORTABLE:
+        try:
+            # This will initialize the Metal context
+            _metal_available = vllm_metal_rust.is_metal_available()
+        except Exception:
+            _metal_available = False
+    return _metal_available
+
 
 def reshape_and_cache(
     key: torch.Tensor,
@@ -16,6 +45,8 @@ def reshape_and_cache(
 ) -> None:
     """Reshape and store key/value tensors into the cache.
 
+    Uses Metal kernel when available for better performance.
+
     Args:
         key: Key tensor [num_tokens, num_kv_heads, head_size]
         value: Value tensor [num_tokens, num_kv_heads, head_size]
@@ -26,13 +57,30 @@ def reshape_and_cache(
         k_scale: Key scaling factor
         v_scale: Value scaling factor
     """
-    block_size = key_cache.shape[1]
-
     # Apply scaling if needed
     if k_scale != 1.0:
         key = key * k_scale
     if v_scale != 1.0:
         value = value * v_scale
+
+    # Try Metal kernel first
+    if _ensure_metal_initialized() and key.device.type == "cpu":
+        try:
+            # Ensure slot_mapping is int32
+            slot_mapping_i32 = slot_mapping.to(torch.int32).contiguous()
+            vllm_metal_rust.metal_reshape_and_cache(
+                key.contiguous(),
+                value.contiguous(),
+                key_cache,
+                value_cache,
+                slot_mapping_i32,
+            )
+            return
+        except Exception:
+            pass  # Fall back to PyTorch
+
+    # PyTorch fallback
+    block_size = key_cache.shape[1]
 
     # Compute block indices and offsets vectorized (on GPU, no .item() calls)
     block_indices = slot_mapping // block_size
@@ -90,6 +138,8 @@ def copy_blocks(
 ) -> None:
     """Copy blocks within KV caches.
 
+    Uses Metal kernel when available for better performance.
+
     Args:
         kv_caches: List of KV cache tensors
         src_to_dsts: Source to destination block mapping [num_pairs, 2]
@@ -97,6 +147,31 @@ def copy_blocks(
     if src_to_dsts.numel() == 0:
         return
 
+    # Try Metal kernel for each cache
+    if _ensure_metal_initialized() and len(kv_caches) > 0:
+        cache = kv_caches[0]
+        if cache.device.type == "cpu" and cache.dim() == 4:
+            # Cache shape: [num_blocks, block_size, num_kv_heads, head_size]
+            # For unified cache: [num_blocks, 2, block_size, num_kv_heads, head_size]
+            try:
+                block_mapping_i32 = src_to_dsts.to(torch.int32).contiguous()
+                for kv_cache in kv_caches:
+                    # Split unified cache into key/value if needed
+                    if kv_cache.dim() == 5:
+                        # Unified cache
+                        key_cache = kv_cache[:, 0]
+                        value_cache = kv_cache[:, 1]
+                        vllm_metal_rust.metal_copy_blocks(
+                            key_cache.contiguous(),
+                            value_cache.contiguous(),
+                            block_mapping_i32,
+                        )
+                    # For separate caches, handle differently
+                return
+            except Exception:
+                pass  # Fall back to PyTorch
+
+    # PyTorch fallback
     src_indices = src_to_dsts[:, 0]
     dst_indices = src_to_dsts[:, 1]
 

@@ -11,7 +11,7 @@ use std::ffi::c_void;
 use std::path::Path;
 
 /// Ensure the Metal shader library is loaded.
-fn ensure_library_loaded() -> PyResult<()> {
+pub fn ensure_library_loaded() -> PyResult<()> {
     let ctx = MetalContext::get();
     if ctx.library().is_some() {
         return Ok(());

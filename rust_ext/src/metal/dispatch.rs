@@ -111,8 +111,9 @@ impl<'a> ComputeCommand<'a> {
             }
         }
 
-        // Dispatch threads
-        encoder.dispatchThreads_threadsPerThreadgroup(
+        // Dispatch threadgroups (grid_size is number of threadgroups, not total threads)
+        // Our kernels use threadgroup_position_in_grid, so we need threadgroup dispatch
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
             self.grid_size,
             self.threadgroup_size,
         );
@@ -164,8 +165,8 @@ impl<'a> ComputeCommand<'a> {
             }
         }
 
-        // Dispatch threads
-        encoder.dispatchThreads_threadsPerThreadgroup(
+        // Dispatch threadgroups
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
             self.grid_size,
             self.threadgroup_size,
         );

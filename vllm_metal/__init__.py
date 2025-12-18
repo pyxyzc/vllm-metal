@@ -12,6 +12,10 @@ import os
 # in the scheduler. This must be set BEFORE vllm.envs is imported anywhere.
 os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "1")
 
+# Metal/Rust contexts cannot survive fork(), so use spawn multiprocessing.
+# This must be set before any multiprocessing is used.
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
 __version__ = "0.1.0"
 
 

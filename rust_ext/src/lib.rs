@@ -137,6 +137,19 @@ fn vllm_metal_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(metal::attention_ops::load_metal_library, m)?)?;
         m.add_function(wrap_pyfunction!(metal::attention_ops::is_metal_available, m)?)?;
         m.add_function(wrap_pyfunction!(metal::attention_ops::metal_device_info, m)?)?;
+
+        // RMS Normalization operations
+        m.add_function(wrap_pyfunction!(metal::kernel_ops::metal_rms_norm, m)?)?;
+        m.add_function(wrap_pyfunction!(metal::kernel_ops::metal_fused_add_rms_norm, m)?)?;
+
+        // RoPE operations
+        m.add_function(wrap_pyfunction!(metal::kernel_ops::metal_rope_forward, m)?)?;
+        m.add_function(wrap_pyfunction!(metal::kernel_ops::metal_rope_inplace, m)?)?;
+        m.add_function(wrap_pyfunction!(metal::kernel_ops::metal_rope_decode, m)?)?;
+
+        // KV Cache operations
+        m.add_function(wrap_pyfunction!(metal::kernel_ops::metal_reshape_and_cache, m)?)?;
+        m.add_function(wrap_pyfunction!(metal::kernel_ops::metal_copy_blocks, m)?)?;
     }
 
     Ok(())
