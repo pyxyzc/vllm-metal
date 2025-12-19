@@ -49,7 +49,9 @@ smoke_test() {
 installs() {
   section "Installing vllm"
 
-  ./install.sh
+  if [ "$(uname)" == "Darwin" ]; then
+    ./install.sh
+  fi
 
   if is_apple_silicon; then
     if ! command -v shellcheck &> /dev/null; then
@@ -103,7 +105,9 @@ main() {
   section "Verifying package import"
   python -c "import vllm_metal; print('vllm_metal imported successfully')"
 
-  smoke_test
+  if [ "$(uname)" == "Darwin" ]; then
+    smoke_test
+  fi
 }
 
 main "$@"
