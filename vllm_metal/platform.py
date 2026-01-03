@@ -7,11 +7,13 @@ from typing import TYPE_CHECKING, Any
 
 import psutil
 import torch
+from vllm.attention.backends.registry import AttentionBackendEnum
 from vllm.platforms.interface import Platform, PlatformEnum
 
 from vllm_metal.config import get_config
 
 if TYPE_CHECKING:
+    from vllm.attention.selector import AttentionSelectorConfig
     from vllm.config import VllmConfig
 
 logger = logging.getLogger(__name__)
@@ -233,14 +235,19 @@ class MetalPlatform(Platform):
         )
 
     @classmethod
-    def get_attn_backend_cls(cls) -> Any:
-        """Get the attention backend class for Metal.
-
-        Returns:
-            Attention backend class
-        """
-        # Return None to use default attention
-        return None
+    def get_attn_backend_cls(
+        cls,
+        selected_backend: "AttentionBackendEnum",
+        attn_selector_config: "AttentionSelectorConfig",
+    ) -> str:
+        """Get the attention backend class for Metal."""
+        if selected_backend and selected_backend != AttentionBackendEnum.CPU_ATTN:
+            logger.info(f"Cannot use {selected_backend} backend on Metal/MLX.")
+        if attn_selector_config.use_mla:
+            raise NotImplementedError("MLA is not supported on Metal/MLX.")
+        if attn_selector_config.use_sparse:
+            raise NotImplementedError("Sparse Attention is not supported on Metal/MLX.")
+        return AttentionBackendEnum.CPU_ATTN.get_path()
 
     @classmethod
     def verify_quantization(cls, quant: str) -> None:

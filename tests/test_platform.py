@@ -4,6 +4,9 @@
 import platform
 
 import pytest
+import torch
+from vllm.attention.backends.registry import AttentionBackendEnum
+from vllm.attention.selector import AttentionSelectorConfig
 
 from vllm_metal.platform import MetalPlatform
 
@@ -40,6 +43,41 @@ class TestMetalPlatform:
         major, minor = MetalPlatform.get_device_capability()
         assert isinstance(major, int)
         assert isinstance(minor, int)
+
+    def test_get_attn_backend_cls_returns_cpu_backend(self) -> None:
+        """Metal platform should return a concrete backend path."""
+        cfg = AttentionSelectorConfig(
+            head_size=128,
+            dtype=torch.float16,
+            kv_cache_dtype="auto",
+            block_size=16,
+        )
+        backend = MetalPlatform.get_attn_backend_cls(AttentionBackendEnum.CPU_ATTN, cfg)
+        assert backend == AttentionBackendEnum.CPU_ATTN.get_path()
+
+    def test_get_attn_backend_cls_rejects_mla(self) -> None:
+        """MLA is not supported on Metal/MLX."""
+        cfg = AttentionSelectorConfig(
+            head_size=128,
+            dtype=torch.float16,
+            kv_cache_dtype="auto",
+            block_size=16,
+            use_mla=True,
+        )
+        with pytest.raises(NotImplementedError, match="MLA is not supported"):
+            MetalPlatform.get_attn_backend_cls(AttentionBackendEnum.CPU_ATTN, cfg)
+
+    def test_get_attn_backend_cls_rejects_sparse(self) -> None:
+        """Sparse attention is not supported on Metal/MLX."""
+        cfg = AttentionSelectorConfig(
+            head_size=128,
+            dtype=torch.float16,
+            kv_cache_dtype="auto",
+            block_size=16,
+            use_sparse=True,
+        )
+        with pytest.raises(NotImplementedError, match="Sparse Attention is not supported"):
+            MetalPlatform.get_attn_backend_cls(AttentionBackendEnum.CPU_ATTN, cfg)
 
     def test_memory_info(self) -> None:
         """Test memory information."""
