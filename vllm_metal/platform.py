@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 import psutil
 import torch
 from vllm.attention.backends.registry import AttentionBackendEnum
-from vllm.platforms.interface import Platform, PlatformEnum
+from vllm.platforms.interface import DeviceCapability, Platform, PlatformEnum
 
 from vllm_metal.config import get_config
 
@@ -110,7 +110,7 @@ class MetalPlatform(Platform):
             return False
 
     @classmethod
-    def get_device_capability(cls, device_id: int = 0) -> tuple[int, int]:
+    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability:
         """Get device compute capability.
 
         Returns a fake capability for compatibility with CUDA-centric code.
@@ -119,10 +119,10 @@ class MetalPlatform(Platform):
             device_id: Device index (ignored)
 
         Returns:
-            Tuple of (major, minor) version
+            DeviceCapability with (major, minor) version
         """
         # Return a reasonable value for compatibility
-        return (8, 0)
+        return DeviceCapability(major=8, minor=0)
 
     @classmethod
     def get_device_count(cls) -> int:
@@ -259,10 +259,10 @@ class MetalPlatform(Platform):
         Raises:
             ValueError: If quantization is not supported
         """
-        supported = {"none", None, "fp16", "bfloat16"}
-        if quant not in supported:
-            msg = f"Metal does not support quantization: {quant}"
-            raise ValueError(msg)
+        # Allow all quantization methods to pass through - actual support
+        # depends on the model implementation. This avoids blocking models
+        # that use quantization formats we may be able to handle.
+        pass
 
     @classmethod
     def is_pin_memory_available(cls) -> bool:

@@ -115,17 +115,13 @@ class TestMetalPlatform:
         assert device.type in ("mps", "cpu")
 
     def test_verify_quantization_supported(self) -> None:
-        """Test supported quantization methods."""
-        # These should not raise
+        """Test that verify_quantization allows all methods to pass through."""
+        # All quantization methods should pass through - actual support depends
+        # on model implementation, not the platform
         MetalPlatform.verify_quantization("none")
         MetalPlatform.verify_quantization(None)
         MetalPlatform.verify_quantization("fp16")
         MetalPlatform.verify_quantization("bfloat16")
-
-    def test_verify_quantization_unsupported(self) -> None:
-        """Test unsupported quantization methods."""
-        with pytest.raises(ValueError, match="does not support"):
-            MetalPlatform.verify_quantization("int8")
-
-        with pytest.raises(ValueError, match="does not support"):
-            MetalPlatform.verify_quantization("awq")
+        MetalPlatform.verify_quantization("int8")
+        MetalPlatform.verify_quantization("awq")
+        MetalPlatform.verify_quantization("compressed-tensors")
